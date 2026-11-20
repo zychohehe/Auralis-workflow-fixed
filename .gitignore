@@ -1,0 +1,80 @@
+# Gradle & Android Build Artifacts
+.gradle/
+.kotlin/
+build/
+*/build/
+*.apk
+*.aab
+local.properties
+.cxx/
+
+# Logs & Temp Files
+logs/
+*.log
+__pycache__/
+*.py[cod]
+/vlc-help.txt
+
+# Editor & OS files
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.iml
+.DS_Store
+Thumbs.db
+*.sw?
+.claude/
+.agents/
+.firebase/
+
+# Environment Secrets & API Keys
+.env
+.env.*
+!.env.example
+secrets.properties
+/android/app/google-services.json
+/windows/src/main/resources/firebase-desktop.json
+*.keystore
+*.jks
+
+# Scratch & Temporary Test Media
+*.mp4
+*.wav
+*.mp3
+*.ogg
+*.tar.gz
+shazam_pkg/
+scratch/
+*.db
+*.sqlite
+android/app/src/debug/assets/restore_covers.json
+scratch_yt_res.json
+*.pb
+scratch_audio/
+scratch_*.json
+/package-lock.json
+docs/verification-logs/
+# Test lyrics fixtures (copyrighted lyrics; kept locally, tests skip when missing)
+creep_raw.ttml
+*.ttml
+!android/app/src/**/*.ttml
+
+
+.empryo
+.codex-remote-attachments/
+*.xml.dump
+window_dump.xml
+test_queue.py
+
+# Discord Social SDK (proprietary; not redistributable). Place it locally to build:
+#   android/app/libs/*.jar, android/app/src/main/jniLibs/<abi>/libdiscord_partner_sdk.so,
+#   android/app/src/main/cpp/discord/*.h
+android/app/libs/
+android/app/src/main/jniLibs/
+android/app/src/main/cpp/discord/
+
+# Owner-provided desktop OAuth configuration; bundled locally, never committed.
+/windows/local-resources/
+
+# Firestore rules tests
+firestore-tests/node_modules/

@@ -1,0 +1,203 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths-ignore: ['**.md', 'docs/**']
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+# Dibutuhkan agar job bisa membuat GitHub Release (APK langsung bisa diunduh, tanpa zip).
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Versi ini harus sama dengan android/app/build.gradle.kts
+      NDK_VERSION: "27.2.12479018"
+      CMAKE_VERSION: "3.22.1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Gradle 8.11 tidak mendukung JDK 25. Pakai 21 (sama dengan lokal).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      # Sengaja TIDAK pakai gradle/actions/setup-gradle: action itu menyuntik init script Groovy
+      # ke ~/.gradle/init.d yang gagal dikompilasi Gradle 8.11 ("Unsupported class file major
+      # version 69"), jadi build mati sebelum project dibaca. Cache diatur manual di bawah.
+      - name: Bersihkan init script Gradle sisa
+        run: rm -rf "$HOME/.gradle/init.d" "$HOME/.gradle/init.gradle"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/build-cache-1
+            ~/.gradle/wrapper/dists
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/libs.versions.toml', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # gradle.properties berisi path Windows (C:/Program Files/...) yang bikin build Linux gagal.
+      - name: Hapus org.gradle.java.home milik Windows
+        run: |
+          sed -i '/^org.gradle.java.home=/d' gradle.properties
+          # Paksa daemon Gradle memakai JDK 21 (runner ubuntu-latest punya JDK 25 yang membuat
+          # Groovy di Gradle 8.11 gagal: "Unsupported class file major version 69").
+          echo "org.gradle.java.home=${JAVA_HOME}" >> gradle.properties
+          echo "org.gradle.java.installations.auto-download=false" >> gradle.properties
+          echo "JAVA_HOME=${JAVA_HOME}"; "${JAVA_HOME}/bin/java" -version
+
+      - name: Install NDK dan CMake
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(command -v sdkmanager || ls "$SDK_ROOT"/cmdline-tools/*/bin/sdkmanager | head -n 1)"
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null
+          set -o pipefail
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
+          echo "sdk.dir=$SDK_ROOT" > local.properties
+
+      # Discord Social SDK bersifat proprietary dan di-.gitignore, jadi tidak ada di repo.
+      # Cara 1: commit file-nya ke repo PRIVATE (hapus barisnya dari .gitignore).
+      # Cara 2: simpan zip-nya di URL privat dan isi secret DISCORD_SDK_URL.
+      #   Isi zip: libs/*.jar, jniLibs/<abi>/libdiscord_partner_sdk.so, discord/*.h
+      - name: Siapkan Discord Social SDK
+        env:
+          DISCORD_SDK_URL: ${{ secrets.DISCORD_SDK_URL }}
+        run: |
+          set -euo pipefail
+          APP=android/app
+          if [ ! -f "$APP/libs/discord_partner_sdk.jar" ] && [ -n "${DISCORD_SDK_URL:-}" ]; then
+            curl -fsSL "$DISCORD_SDK_URL" -o /tmp/discord-sdk.zip
+            mkdir -p "$APP/libs" "$APP/src/main/jniLibs" "$APP/src/main/cpp/discord"
+            unzip -q -o /tmp/discord-sdk.zip -d /tmp/discord-sdk
+            cp -r /tmp/discord-sdk/libs/. "$APP/libs/"
+            cp -r /tmp/discord-sdk/jniLibs/. "$APP/src/main/jniLibs/"
+            cp -r /tmp/discord-sdk/discord/. "$APP/src/main/cpp/discord/"
+          fi
+          if [ -f "$APP/libs/discord_partner_sdk.jar" ] && [ -f "$APP/libs/libwebrtc.jar" ]; then
+            echo "Discord Social SDK ditemukan: Rich Presence aktif."
+          else
+            echo "::warning::Discord Social SDK tidak ada. Build lanjut tanpa Discord Rich Presence (stub)."
+          fi
+
+      # Release butuh google-services.json. Isi secret GOOGLE_SERVICES_JSON dengan isi file aslinya.
+      # Kalau kosong, dipakai file contoh supaya build tetap jalan (login/sync Firebase tidak akan berfungsi).
+      - name: Siapkan google-services.json
+        env:
+          GOOGLE_SERVICES_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "${GOOGLE_SERVICES_JSON:-}" ]; then
+            printf '%s' "$GOOGLE_SERVICES_JSON" > android/app/google-services.json
+          else
+            echo "::warning::Secret GOOGLE_SERVICES_JSON kosong, memakai google-services.example.json"
+            cp android/app/google-services.example.json android/app/google-services.json
+          fi
+
+      # Release memakai signingConfig "debug". Pastikan keystore-nya ada supaya APK ter-sign,
+      # bukan "app-release-unsigned.apk". Kalau secret keystore diisi, build.gradle.kts memakainya.
+      - name: Siapkan keystore signing
+        env:
+          AURALIS_KEYSTORE_BASE64: ${{ secrets.AURALIS_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android"
+          if [ -n "${AURALIS_KEYSTORE_BASE64:-}" ]; then
+            echo "$AURALIS_KEYSTORE_BASE64" | base64 -d > "$HOME/.android/auralis-release.keystore"
+            echo "Memakai keystore rilis dari secret."
+          elif [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -v -keystore "$HOME/.android/debug.keystore" -storepass android \
+              -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Build release APK
+        env:
+          AURALIS_POTOKEN_API_KEY: ${{ secrets.AURALIS_POTOKEN_API_KEY }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          AURALIS_KEYSTORE_PASSWORD: ${{ secrets.AURALIS_KEYSTORE_PASSWORD }}
+          AURALIS_KEY_ALIAS: ${{ secrets.AURALIS_KEY_ALIAS }}
+          AURALIS_KEY_PASSWORD: ${{ secrets.AURALIS_KEY_PASSWORD }}
+        run: chmod +x gradlew && ./gradlew :app:assembleRelease --stacktrace
+
+      # AGP menamai output "app-release-unsigned.apk" bila signing gagal, dan APK unsigned tidak bisa
+      # di-install ("paket tidak valid"). Langkah ini mencari APK APAPUN di outputs, memastikan sudah
+      # ter-sign, lalu menyalinnya ke satu nama tetap. Kalau tidak ada, isi folder dicetak ke log.
+      - name: Cari dan verifikasi APK
+        id: apk
+        run: |
+          set -euo pipefail
+          OUT=android/app/build/outputs
+          echo "== Isi $OUT =="; find "$OUT" -type f | sort || true
+          APK="$(find "$OUT/apk/release" -maxdepth 1 -name '*.apk' | sort | head -n 1 || true)"
+          if [ -z "$APK" ]; then
+            echo "::error::Build selesai tapi tidak ada file .apk di $OUT/apk/release (lihat daftar file di atas)."
+            exit 1
+          fi
+          case "$APK" in
+            *unsigned*) echo "::error::APK belum ter-sign ($APK). Cek signingConfig release."; exit 1 ;;
+          esac
+          VERSION="$(grep -m1 'versionName' android/app/build.gradle.kts | sed -E 's/.*"([^"]+)".*/\1/')"
+          NAME="Auralis-v${VERSION}-universal.apk"
+          mkdir -p dist
+          cp "$APK" "dist/$NAME"
+          APKSIGNER="$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [ -n "$APKSIGNER" ]; then "$APKSIGNER" verify --print-certs "dist/$NAME" | head -n 5; fi
+          ls -l "dist/$NAME"
+          sha256sum "dist/$NAME" | tee "dist/$NAME.sha256"
+          cp android/app/build/outputs/mapping/release/mapping.txt "dist/mapping-v${VERSION}.txt" 2>/dev/null || true
+          {
+            echo "name=$NAME"
+            echo "path=dist/$NAME"
+            echo "version=$VERSION"
+          } >> "$GITHUB_OUTPUT"
+
+      # File .apk diunggah apa adanya (archive: false) sehingga hasil unduhan langsung .apk, bukan .zip.
+      # Syarat: upload-artifact v7+, dan hanya satu file per artifact.
+      - name: Upload APK (langsung .apk, tanpa zip)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.apk.outputs.name }}
+          path: ${{ steps.apk.outputs.path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      # Cara paling mudah mengunduh: tab Releases di GitHub, APK-nya langsung jadi asset.
+      - name: Publish ke GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="v${{ steps.apk.outputs.version }}-build${{ github.run_number }}"
+          NOTES="Build otomatis dari commit ${GITHUB_SHA::7}. Unduh file .apk lalu install langsung di Android 7.0+."
+          gh release create "$TAG" \
+            "dist/${{ steps.apk.outputs.name }}" \
+            "dist/${{ steps.apk.outputs.name }}.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "Auralis ${{ steps.apk.outputs.version }} (build ${{ github.run_number }})" \
+            --notes "$NOTES" \
+            --latest
+          if ls dist/mapping-*.txt >/dev/null 2>&1; then gh release upload "$TAG" dist/mapping-*.txt; fi
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-reports
+          path: |
+            **/build/reports/**
+            **/hs_err_pid*.log
+            android/app/build/outputs/**
+          if-no-files-found: ignore
